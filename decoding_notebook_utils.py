@@ -8,6 +8,257 @@ from mne.decoding import SlidingEstimator
 from scipy.stats import pearsonr
 from sklearn.linear_model import RidgeCV
 import pandas as pd
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class CPCAResult:
+    """Results container for Circular PCA."""
+    components: np.ndarray           # shape (n_components, n_features), complex
+    scores: np.ndarray               # shape (n_samples, n_components), complex
+    singular_values: np.ndarray      # shape (n_components,), real
+    explained_variance: np.ndarray   # shape (n_components,), real
+    explained_variance_ratio: np.ndarray  # shape (n_components,), real
+    mean: np.ndarray                 # shape (n_features,), complex
+
+
+class CircularPCA:
+    """
+    Circular (Proper) Complex PCA (CPCA).
+
+    Operates on complex-valued data X ∈ C^{NxF} using the Hermitian
+    covariance matrix C = (1/N) * X_c^H @ X_c, which guarantees real
+    eigenvalues and orthonormal complex eigenvectors.
+
+    The input is assumed to already be complex-valued (e.g. the analytic
+    signal obtained via a prior Hilbert transform).
+
+    Parameters
+    ----------
+    n_components : int or None
+        Number of components to keep. If None, keeps all components.
+
+    Raises
+    ------
+    ValueError
+        If the input array is not complex-valued.
+    """
+
+    def __init__(self, n_components: Optional[int] = None):
+        self.n_components = n_components
+        self.result_: Optional[CPCAResult] = None
+
+    def fit_transform(self, X: np.ndarray) -> CPCAResult:
+        """
+        Fit CPCA to X and return a CPCAResult.
+
+        Parameters
+        ----------
+        X : complex array of shape (n_samples, n_features)
+            Must be complex-valued. For neuroimaging, this is typically
+            the analytic signal obtained via scipy.signal.hilbert applied
+            along the time axis before calling this method.
+
+        Returns
+        -------
+        CPCAResult
+        """
+        X = np.asarray(X)
+
+        if not np.iscomplexobj(X):
+            raise ValueError(
+                "Input X must be complex-valued. If you have real-valued data "
+                "(e.g. fMRI/EEG timeseries), apply scipy.signal.hilbert(X, axis=0) "
+                "first to obtain the analytic signal."
+            )
+
+        # --- Center the data ---
+        mean = X.mean(axis=0)
+        X_c = X - mean
+
+        n_samples, n_features = X_c.shape
+        n_components = self.n_components or min(n_samples, n_features)
+
+        # --- SVD on complex data ---
+        # X_c = U @ diag(S) @ V^H  →  C = X_c^H @ X_c / N = V @ diag(S²/N) @ V^H
+        
+        # Check for NaN values that would cause SVD to fail
+        if np.any(np.isnan(X_c)):
+            nan_count = np.sum(np.isnan(X_c))
+            nan_ratio = nan_count / X_c.size
+            raise ValueError(
+                f"Input data contains NaN values ({nan_count} NaN values, {nan_ratio*100:.2f}% of data). "
+                f"This typically occurs when MEG channels have bad data or the Hilbert transform fails. "
+                f"Check your input data for disconnected sensors or artifacts."
+            )
+        
+        # Check for Inf values that could cause numerical instability
+        if np.any(np.isinf(X_c)):
+            inf_count = np.sum(np.isinf(X_c))
+            inf_ratio = inf_count / X_c.size
+            raise ValueError(
+                f"Input data contains Inf values ({inf_count} Inf values, {inf_ratio*100:.2f}% of data). "
+                f"This typically occurs due to division by zero during standardization. "
+                f"Check if any features have zero standard deviation."
+            )
+        
+        # Perform SVD with error handling
+        try:
+            U, S, Vh = np.linalg.svd(X_c, full_matrices=False)
+        except np.linalg.LinAlgError as e:
+            raise ValueError(
+                f"SVD computation failed: {e}. "
+                f"This may be due to numerical instability or ill-conditioned data. "
+                f"Try reducing the number of PCA components or checking data quality."
+            ) from e
+
+        components = Vh[:n_components]                      # (k, n_features), complex
+        scores = X_c @ Vh[:n_components].conj().T           # (n_samples, k), complex
+
+        # --- Explained variance ---
+        explained_variance = (S[:n_components] ** 2) / n_samples
+        total_variance = (S ** 2).sum() / n_samples
+        explained_variance_ratio = explained_variance / total_variance
+
+        self.result_ = CPCAResult(
+            components=components,
+            scores=scores,
+            singular_values=S[:n_components],
+            explained_variance=explained_variance,
+            explained_variance_ratio=explained_variance_ratio,
+            mean=mean,
+        )
+        return self.result_
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Project new complex-valued data onto the fitted components.
+
+        Parameters
+        ----------
+        X : complex array of shape (n_samples, n_features)
+
+        Returns
+        -------
+        scores : complex array of shape (n_samples, n_components)
+        """
+        if self.result_ is None:
+            raise RuntimeError("Call fit_transform before transform.")
+        X = np.asarray(X)
+        if not np.iscomplexobj(X):
+            raise ValueError("Input X must be complex-valued.")
+        X_c = X - self.result_.mean
+        return X_c @ self.result_.components.conj().T
+
+
+def _get_time_freq_features(data, time_freq_options):
+    """
+    Extract time-frequency features from MEG epochs data.
+
+    Processes the input data by filtering into frequency bands, applying Hilbert transform,
+    and extracting specified features (amplitude, phase, real, or imaginary parts).
+    Optionally applies PCA dimensionality reduction using CircularPCA.
+
+    Parameters
+    ----------
+    data : mne.Epochs
+        MEG epochs data to process. Should contain the raw sensor data.
+    time_freq_options : dict
+        Configuration dictionary with the following keys:
+        - 'FREQ_BANDS' : list of tuples
+            List of (low_freq, high_freq) tuples defining frequency bands to extract
+        - 'feature_types' : list of str
+            Types of features to extract from complex signals: 'amplitude', 'phase', 'real', 'imag'
+        - 'time_window' : tuple or None, optional
+            (start_time, end_time) tuple to restrict analysis to specific time window
+        - 'pca' : int or False, optional
+            Number of PCA components to keep. If False, no PCA is applied.
+
+    Returns
+    -------
+    features : np.ndarray
+        Extracted features with shape (n_epochs, n_features * n_bands * n_feature_types, n_times)
+        where n_features depends on whether PCA was applied (n_pca_components vs n_channels * n_bands)
+    times : np.ndarray
+        Time points corresponding to the features, shape (n_times,)
+
+    Notes
+    -----
+    The processing pipeline includes:
+    1. Band-pass filtering and Hilbert transform for each frequency band
+    2. Optional time window restriction
+    3. Optional PCA dimensionality reduction using CircularPCA
+    4. Feature extraction (amplitude/phase/real/imaginary parts)
+    5. Concatenation of all features along the channel axis
+    """
+
+    # filter per frequency band and apply Hilbert transform
+    freq_bands = time_freq_options['FREQ_BANDS']
+    data_band = []
+    for l_freq, h_freq in freq_bands:
+        # filter and apply Hilbert transform for this band
+        _data_band = data.copy(
+                ).filter(l_freq=l_freq, h_freq=h_freq, verbose=False
+                ).apply_hilbert(verbose=False)
+        data_band_array =_data_band.get_data()
+        
+        # Get data only from a specific time window
+        if time_freq_options.get('time_window', None) is not None:
+            times = _data_band.times
+            time_mask = (times >= time_freq_options['time_window'][0]) & (times <= time_freq_options['time_window'][1])
+            data_band_array = data_band_array[:, :, time_mask] # shape: (n_epochs, n_channels, n_times)
+            
+        data_band.append(data_band_array)
+    
+    # concatenate across bands
+    data_band = np.concatenate(data_band, axis=1) # shape: (n_epochs, n_channels * n_bands, n_times)
+
+    # do dimensionality reduction (PCA) if needed
+    if time_freq_options.get('pca', False):
+        n_epochs, n_channels_bands, n_times = data_band.shape
+        # Reshape to (n_channels_bands, n_times * n_epochs)
+        X = data_band.transpose(1, 2, 0).reshape(n_channels_bands, n_times * n_epochs)
+
+        # standardize features (because different bands have different power)
+        mean = np.mean(X, axis=1, keepdims=True)
+        std = np.std(X, axis=1, keepdims=True)
+        
+        # Handle potential division by zero (std=0)
+        std[std == 0] = 1.0  # Set zero std to 1 to avoid division by zero
+        
+        X = (X - mean) / std
+        
+        # Check for NaN/Inf after standardization
+        if np.any(np.isnan(X)):
+            raise ValueError("Standardization produced NaN values. This may indicate constant features.")
+        if np.any(np.isinf(X)):
+            raise ValueError("Standardization produced Inf values. This may indicate numerical instability.")
+
+        # compute PCA
+        cpca = CircularPCA(n_components=time_freq_options['pca'])
+        result = cpca.fit_transform(X.T)  # X.T shape: (n_times * n_epochs, n_channels_bands)
+        # result.scores shape: (n_times * n_epochs, n_pcs)
+        # Reshape back to (n_epochs, n_pcs, n_times)
+        data_band = result.scores.reshape(n_times, n_epochs, time_freq_options['pca']).transpose(1, 2, 0)
+
+    # get requested features
+    band_features = []
+    for feature in time_freq_options['feature_types']:
+        if feature == 'amplitude':
+            band_features.append(np.abs(data_band))
+        elif feature == 'phase':
+            band_features.append(np.angle(data_band))
+        elif feature == 'real':
+            band_features.append(np.real(data_band))
+        elif feature == 'imag':
+            band_features.append(np.imag(data_band))
+        else:
+            raise ValueError(f"Unknown feature: {feature}")
+
+    # concatenate along channels axis
+    # final shape: (n_epochs, n_features * n_bands, n_times)
+    return np.concatenate(band_features, axis=1), times[time_mask]
 
 
 def load_epochs(subject,session, DERIVATIVES_DIR):
@@ -183,7 +434,10 @@ def decoder(X, y, runs, alphas=None, inner_cv_splits=5):
     return observed_mean_corr
 
 
-def run_decoding_for_quantity_and_epoch(SUBJECT_INFO, DERIVATIVES_DIR, quantity, epoch_type, trial_type,sensor_type, baseline, LOWPASS):
+def run_decoding_for_quantity_and_epoch(
+    SUBJECT_INFO, DERIVATIVES_DIR, quantity, epoch_type, 
+    trial_type,sensor_type, baseline, LOWPASS,
+    time_freq_options=None):
     
     """
     High-level helper to run decoding for a given target `quantity`.
@@ -219,8 +473,11 @@ def run_decoding_for_quantity_and_epoch(SUBJECT_INFO, DERIVATIVES_DIR, quantity,
                 continue
             if epoch_type not in epochs.event_id:
                 continue           
-
-            event = epochs[epoch_type].copy().filter(None, LOWPASS).apply_baseline(baseline)
+            
+            if time_freq_options is None:
+                event = epochs[epoch_type].copy().filter(None, LOWPASS).apply_baseline(baseline)
+            else:
+                event = epochs[epoch_type].copy()
             subject_epochs.append(event)
             subject_metadata.append(io_df)
 
@@ -276,7 +533,14 @@ def run_decoding_for_quantity_and_epoch(SUBJECT_INFO, DERIVATIVES_DIR, quantity,
             concatenated_epochs_meg = concatenated_epochs.copy().pick_types(meg='grad')
         else:
             concatenated_epochs_meg = concatenated_epochs.copy().pick_types(meg=True)
-        X = concatenated_epochs_meg.get_data()
+        
+        if time_freq_options is None:
+            X = concatenated_epochs_meg.get_data()
+            times = concatenated_epochs.times
+        else:
+            time_freq_options['time_freq_options'] = sensor_type
+            X, times = _get_time_freq_features(concatenated_epochs, time_freq_options)
+
         
         runs = np.asarray(concatenated_metadata['run'])
         
@@ -288,10 +552,6 @@ def run_decoding_for_quantity_and_epoch(SUBJECT_INFO, DERIVATIVES_DIR, quantity,
         
         if len(y) == 0:
             continue  # skip if nothing left after masking
-        
-        # Save the time axis from the last processed (non-empty) subject.
-        times = concatenated_epochs.times
-
 
         corr = decoder(
             X, y, runs,
@@ -306,4 +566,4 @@ def run_decoding_for_quantity_and_epoch(SUBJECT_INFO, DERIVATIVES_DIR, quantity,
         "times": times,
         "subjects_included": subjects_included,
     }
-
+    
