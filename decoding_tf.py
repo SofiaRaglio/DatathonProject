@@ -3,13 +3,13 @@
 Time-Frequency MEG Decoding - Combined Computation and Analysis Script
 
 This script performs both the computational part (time-frequency decoding of cognitive variables 
-from MEG signals) and the analysis/plotting part (comparison with original time-domain decoding).
+from MEG signals) and the comparison/plotting part (comparison with original time-domain decoding).
 
-Time-Frequency Parameters:
-- Frequency band: (2, 4) Hz (theta band)
-- Features: Real and imaginary parts
-- Time window: (-0.5, 0.75) seconds
-- PCA components: 50
+Time-Frequency parameters are set in this script:
+- Frequency band
+- Features
+- Time window
+- PCA components
 
 Output:
 - Creates timestamped directory with configuration, TF results, and analysis outputs
@@ -34,24 +34,22 @@ SUBJECT_INFO = {'01': {'4': [1,2,3,4,5,6,7,8], '5': [1,2,3,4,5,6,7,8]},
                 '11': {'4': [1,2,3,4,5,6,7,8], '5': [1,2,3,4,5,6,7,8]},
                 '19': {'2': [1,2,3,4,5,6,7,8], '3': [1,2,3,4,5,6,7,8]},
 }
+SUBJECT_IDS = list(SUBJECT_INFO.keys())
 
 # Time-frequency configuration
 TF_CONFIG = {
-    'FREQ_BANDS': [(0.5, 8)],
-    'feature_types': ['real', 'imag'],  # Use real and imaginary parts
-    'time_window': (-0.5, 0.75),        # Extended time window
-    'pca': 50                           # Number of principal components
+    'FREQ_BANDS': [(0.5, 2), (2, 4), (4, 8)],
+    'feature_types': ['real'],
+    'time_window': (-0.5, 0.75),
+    'pca': 50
 }
 
 # Decoding jobs - same as original notebook
 DECODING_JOBS = [
     ("ER_diffRS_z", "response"),      # Expected Reward at response
     ("EU_diffRS_z", "response"),      # Estimated Uncertainty at response
-    ("PE_z", "feedback"),            # Prediction Error at feedback
+    ("PE_z", "feedback"),             # Prediction Error at feedback
 ]
-
-# Subject colors for consistent plotting
-SUBJECT_IDS = ['01', '11', '19']
 
 # Statistical analysis windows
 STAT_WINDOW = {
@@ -73,15 +71,14 @@ config = {
     "analysis_type": "time_frequency_comparison",
     "time_frequency_config": TF_CONFIG,
     "decoding_jobs": DECODING_JOBS,
-    "subjects": list(SUBJECT_INFO.keys()),
+    "subjects": SUBJECT_IDS,
 }
-
 with open(analysis_dir / 'config.json', 'w') as f:
     json.dump(config, f, indent=2)
 print(f"Configuration saved to {analysis_dir / 'config.json'}")
 
-# ===== COMPUTATION PHASE =====
-print("\n=== COMPUTATION PHASE ===")
+# ===== DECODING =====
+print("\n=== DECODING ===")
 
 # Run time-frequency decoding
 tf_results = {}
@@ -94,14 +91,7 @@ for quantity, epoch_type in DECODING_JOBS:
         trial_type='free', sensor_type='mag', baseline=None, LOWPASS=None,
         time_freq_options=TF_CONFIG
     )
-    
-    tf_results[(quantity, epoch_type)] = result
-    print(f"Completed {quantity} at {epoch_type}")
 
-# Restructure results to match original format and save individual NPZ files
-print("\nSaving time-frequency results in original format...")
-
-for (quantity, epoch_type), result in tf_results.items():
     # Create flat structure matching original NPZ format
     flat_result = {'times_s': result['times']}
     for i, sub in enumerate(SUBJECT_IDS):
@@ -112,58 +102,38 @@ for (quantity, epoch_type), result in tf_results.items():
     filename = f'{quantity}_{epoch_type}_tf_free_mag.npz'
     np.savez(analysis_dir / filename, **flat_result)
     print(f"Saved {filename}")
+    
+    tf_results[(quantity, epoch_type)] = flat_result
+    print(f"Completed {quantity} at {epoch_type}")
 
-# Save combined results
-print("\nSaving combined results...")
-np.save(analysis_dir / 'tf_results.npy', tf_results, allow_pickle=True)
-print(f"TF results saved to {analysis_dir / 'tf_results.npy'}")
-
+print(f"TF results saved to {analysis_dir}")
 print(f"\nComputation completed successfully!")
 
-# ===== ANALYSIS/PLOTTING PHASE =====
-print("\n=== ANALYSIS/PLOTTING PHASE ===")
-
-# Load TF results (freshly computed)
-tf_results_loaded = {}
-ER_tf = np.load(analysis_dir / 'ER_diffRS_z_response_tf_free_mag.npz')
-EU_tf = np.load(analysis_dir / 'EU_diffRS_z_response_tf_free_mag.npz')
-PE_tf = np.load(analysis_dir / 'PE_z_feedback_tf_free_mag.npz')
-
-tf_results_loaded[('ER_diffRS_z', 'response')] = ER_tf
-tf_results_loaded[('EU_diffRS_z', 'response')] = EU_tf
-tf_results_loaded[('PE_z', 'feedback')] = PE_tf
-
-print(f"TF results loaded from {analysis_dir}")
+# ===== COMPARISON/PLOTTING =====
+print("\n=== COMPARISON/PLOTTING ===")
+print("=== TODO: Implement comparison with original results ===")
+print("=== TOD
 
 # Load original results
-original_results = {}
-
-ER_original = np.load(OUTPUT_DIR / 'ER_diffRS_z_response_free_mag_None_15.npz')
-EU_original = np.load(OUTPUT_DIR / 'EU_diffRS_z_response_free_mag_None_15.npz')
-PE_original = np.load(OUTPUT_DIR / 'PE_z_feedback_free_mag_None_15.npz')
 null_model = np.load(OUTPUT_DIR / 'null_model_correlation.npz')
-
-original_results[('ER_diffRS_z', 'response')] = ER_original
-original_results[('EU_diffRS_z', 'response')] = EU_original
-original_results[('PE_z', 'feedback')] = PE_original
-
+original_results = {}
+for quantity, epoch_type in DECODING_JOBS:
+    filename = f'{quantity}_{epoch_type}_free_mag_None_15.npz'
+    original_results[(quantity, epoch_type)] = np.load(OUTPUT_DIR / filename)
 print("Original results loaded successfully")
 
 # Create comparison plots
 print("\nCreating comparison plots...")
 
-fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
-titles = [
-    'ER_diffRS_z (Expected Reward) at Response',
-    'EU_diffRS_z (Estimated Uncertainty) at Response',
-    'PE_z (Prediction Error) at Feedback'
-]
+fig, axes = plt.subplots(len(DECODING_JOBS), 1, figsize=(10, 12), sharex=True)
+titles = [f'{quantity} at {epoch_type}'
+          for quantity, epoch_type in DECODING_JOBS]
 
 for i, (ax, title) in enumerate(zip(axes, titles)):
     quantity, epoch_type = DECODING_JOBS[i]
     
     # Get time points
-    tf_times = tf_results_loaded[(quantity, epoch_type)]['times_s']
+    tf_times = tf_results[(quantity, epoch_type)]['times_s']
     orig_times = original_results[(quantity, epoch_type)]['times_s']
     
     # Plot null model
@@ -172,20 +142,18 @@ for i, (ax, title) in enumerate(zip(axes, titles)):
     
     # Plot results for each subject
     for j, sid in enumerate(SUBJECT_IDS):
-        color = f'C{j}'
-        
         # Time-frequency results (plain lines)
         tf_key = f'corr_r_sub{sid}'
-        if tf_key in tf_results_loaded[(quantity, epoch_type)]:
-            tf_corr = tf_results_loaded[(quantity, epoch_type)][tf_key]
-            ax.plot(tf_times, tf_corr, color=color, linestyle='-',
+        if tf_key in tf_results[(quantity, epoch_type)]:
+            tf_corr = tf_results[(quantity, epoch_type)][tf_key]
+            ax.plot(tf_times, tf_corr, color=f'C{j}', linestyle='-',
                     label=f'TF sub-{sid}', linewidth=2)
         
         # Original results (dashed lines)
         orig_key = f'corr_r_sub{sid}'
         if orig_key in original_results[(quantity, epoch_type)]:
             orig_corr = original_results[(quantity, epoch_type)][orig_key]
-            ax.plot(orig_times, orig_corr, color=color, linestyle='-', alpha=0.5,
+            ax.plot(orig_times, orig_corr, color=f'C{j}', linestyle='-', alpha=0.5,
                     label=f'Orig sub-{sid}', linewidth=1)
     
     # Formatting
@@ -211,7 +179,7 @@ stats = {}
 
 for quantity, epoch_type in DECODING_JOBS:
     # Get time points and create mask
-    tf_times = tf_results_loaded[(quantity, epoch_type)]['times_s']
+    tf_times = tf_results[(quantity, epoch_type)]['times_s']
     orig_times = original_results[(quantity, epoch_type)]['times_s']
     
     tf_mask = (tf_times >= STAT_WINDOW[epoch_type][0]) & (tf_times <= STAT_WINDOW[epoch_type][1])
@@ -224,8 +192,8 @@ for quantity, epoch_type in DECODING_JOBS:
         
         # TF method statistics
         tf_key = f'corr_r_sub{sid}'
-        if tf_key in tf_results_loaded[(quantity, epoch_type)]:
-            tf_corr = tf_results_loaded[(quantity, epoch_type)][tf_key]
+        if tf_key in tf_results[(quantity, epoch_type)]:
+            tf_corr = tf_results[(quantity, epoch_type)][tf_key]
             stats[sid][f'{quantity}_tf'] = np.mean(tf_corr[tf_mask])
         
         # Original method statistics
@@ -239,30 +207,8 @@ stats_df = pd.DataFrame(stats).T
 print("\n Summary Statistics (mean correlation in event window):")
 print(stats_df)
 
-# Calculate and display improvements
-print("\n Performance Improvement (TF - Original):")
-
-for quantity, epoch_type in DECODING_JOBS:
-    quantity_key = quantity.split('_')[0]  # 'ER', 'EU', 'PE'
-    tf_col = f'{quantity_key}_tf'
-    orig_col = f'{quantity_key}_orig'
-    
-    # Use full column names instead of shortened versions
-    tf_col = f'{quantity}_tf'
-    orig_col = f'{quantity}_orig'
-    
-    improvement = stats_df[tf_col].mean() - stats_df[orig_col].mean()
-    tf_mean = stats_df[tf_col].mean()
-    orig_mean = stats_df[orig_col].mean()
-    
-    print(f'{quantity.split("_")[0]}: {improvement:+.3f} ' +
-            f'(TF: {tf_mean:.3f}, Orig: {orig_mean:.3f})')
-
 # Save statistics to CSV
 stats_df.to_csv(analysis_dir / 'tf_vs_original_statistics.csv')
 print(f"\n Statistics saved to {analysis_dir / 'tf_vs_original_statistics.csv'}")
 
-print(f"\nAnalysis completed successfully!")
-
 print(f"\n=== ALL PROCESSING COMPLETED ===")
-print(f"\nResults saved in: {analysis_dir}")
