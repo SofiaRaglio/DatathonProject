@@ -1,0 +1,48 @@
+{
+  "timestamp": "20260409_161649",
+  "analysis_type": "time_frequency_comparison",
+  "time_frequency_config": {
+    "FREQ_BANDS": [
+      [
+        0.5,
+        2
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        4,
+        8
+      ]
+    ],
+    "feature_types": [
+      "real",
+      "imag"
+    ],
+    "time_window": [
+      -0.5,
+      0.75
+    ],
+    "pca": 50
+  },
+  "decoding_jobs": [
+    [
+      "ER_diffRS_z",
+      "response"
+    ],
+    [
+      "EU_diffRS_z",
+      "response"
+    ],
+    [
+      "PE_z",
+      "feedback"
+    ]
+  ],
+  "subjects": [
+    "01",
+    "11",
+    "19"
+  ]
+}
