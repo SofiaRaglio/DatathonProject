@@ -22,7 +22,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import json
-from decoding_notebook_utils import run_decoding_for_quantity_and_epoch
+from decoding_notebook_utils import run_decoding_for_quantity_and_epoch, TupleKeyEncoder
 
 # Configuration
 DERIVATIVES_DIR = Path('/home/fmeyniel/nasShare/projects/EXPLORE_PLUS/DatathonProject/derivatives')
@@ -38,11 +38,20 @@ SUBJECT_IDS = list(SUBJECT_INFO.keys())
 
 # Time-frequency configuration
 TF_CONFIG = {
-    'FREQ_BANDS': [(0.5, 2), (2, 4), (4, 8)],
-    'feature_types': ['real'],
-    'time_window': (-0.5, 0.75),
-    'pca': 50
-}
+        'FREQ_BANDS': [(0.5, 2),
+                       (2, 4),
+                       (4, 8),
+                       (8, 12),
+                       (12, 40)],
+        'feature_types': [['real', 'imag'],
+                          ['real', 'imag'],
+                          ['real', 'imag'],
+                          ['amplitude'],
+                          ['amplitude']],
+        'time_window': (-0.5, 0.75),
+        'pca': {'amplitude': 40,
+                ('real', 'imag'): 80}
+    }
 
 # Decoding jobs - same as original notebook
 DECODING_JOBS = [
@@ -74,7 +83,7 @@ config = {
     "subjects": SUBJECT_IDS,
 }
 with open(analysis_dir / 'config.json', 'w') as f:
-    json.dump(config, f, indent=2)
+    json.dump(config, f, indent=2, cls=TupleKeyEncoder)
 print(f"Configuration saved to {analysis_dir / 'config.json'}")
 
 # ===== DECODING =====
@@ -111,8 +120,7 @@ print(f"\nComputation completed successfully!")
 
 # ===== COMPARISON/PLOTTING =====
 print("\n=== COMPARISON/PLOTTING ===")
-print("=== TODO: Implement comparison with original results ===")
-print("=== TOD
+print("=== Implement comparison with original results ===")
 
 # Load original results
 null_model = np.load(OUTPUT_DIR / 'null_model_correlation.npz')

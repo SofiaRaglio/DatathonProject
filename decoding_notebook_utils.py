@@ -1,5 +1,6 @@
 import mne
 from pathlib import Path
+import json
 import numpy as np
 from sklearn.model_selection import KFold, LeaveOneGroupOut
 from sklearn.pipeline import make_pipeline
@@ -10,6 +11,32 @@ from sklearn.linear_model import RidgeCV
 import pandas as pd
 from dataclasses import dataclass
 from typing import Optional
+
+
+class TupleKeyEncoder(json.JSONEncoder):
+    """JSON encoder that converts tuple dict keys to strings.
+
+    Useful for serializing configs where PCA dicts use tuple keys
+    like ``('real', 'imag')`` to group feature types.
+
+    Works with both ``json.dumps`` and ``json.dump``.
+    """
+
+    def encode(self, o):
+        return super().encode(self._convert_keys(o))
+
+    def iterencode(self, o, _one_shot=False):
+        return super().iterencode(self._convert_keys(o), _one_shot)
+
+    def _convert_keys(self, obj):
+        if isinstance(obj, dict):
+            return {
+                str(k) if isinstance(k, tuple) else k: self._convert_keys(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [self._convert_keys(i) for i in obj]
+        return obj
 
 
 @dataclass
@@ -152,6 +179,211 @@ class CircularPCA:
         return X_c @ self.result_.components.conj().T
 
 
+def _normalize_feature_types(feature_types, n_bands):
+    """
+    Normalize feature_types into a per-band list-of-lists format.
+
+    Parameters
+    ----------
+    feature_types : str, list of str, or list of (str or list of str)
+        Homogeneous: a single string or list of strings applied to all bands.
+        Heterogeneous: a list of length n_bands where each element is a string
+        or list of strings specifying features for that band.
+    n_bands : int
+        Number of frequency bands.
+
+    Returns
+    -------
+    per_band : list of list of str
+        Length n_bands, each element is a list of feature type strings.
+    is_heterogeneous : bool
+        True if per-band specification was detected.
+    """
+    VALID_FEATURES = {'amplitude', 'phase', 'real', 'imag'}
+
+    if isinstance(feature_types, str):
+        # Single string → homogeneous
+        if feature_types not in VALID_FEATURES:
+            raise ValueError(f"Unknown feature type: '{feature_types}'. Valid: {VALID_FEATURES}")
+        return [[feature_types]] * n_bands, False
+
+    if not isinstance(feature_types, list) or len(feature_types) == 0:
+        raise ValueError("feature_types must be a non-empty string or list.")
+
+    # Check if any element is a list → heterogeneous
+    has_list = any(isinstance(ft, list) for ft in feature_types)
+
+    if not has_list:
+        # All strings → homogeneous, applied to every band
+        for ft in feature_types:
+            if ft not in VALID_FEATURES:
+                raise ValueError(f"Unknown feature type: '{ft}'. Valid: {VALID_FEATURES}")
+        return [list(feature_types)] * n_bands, False
+
+    # Heterogeneous: must match n_bands
+    if len(feature_types) != n_bands:
+        raise ValueError(
+            f"Heterogeneous feature_types length ({len(feature_types)}) "
+            f"must match number of frequency bands ({n_bands})."
+        )
+    per_band = []
+    for i, ft in enumerate(feature_types):
+        if isinstance(ft, str):
+            ft = [ft]
+        for f in ft:
+            if f not in VALID_FEATURES:
+                raise ValueError(f"Unknown feature type '{f}' for band {i}. Valid: {VALID_FEATURES}")
+        per_band.append(list(ft))
+    return per_band, True
+
+
+def _group_bands_by_features(per_band_features):
+    """
+    Group band indices by their feature type set.
+
+    Parameters
+    ----------
+    per_band_features : list of list of str
+        Per-band feature types (output of _normalize_feature_types).
+
+    Returns
+    -------
+    groups : dict
+        Keys are canonical group identifiers: a string if single feature,
+        or a tuple of sorted strings if multiple features.
+        Values are lists of band indices belonging to that group.
+    """
+    groups = {}
+    for idx, features in enumerate(per_band_features):
+        key = features[0] if len(features) == 1 else tuple(sorted(features))
+        groups.setdefault(key, []).append(idx)
+    return groups
+
+
+def _validate_pca_option(pca, groups, is_heterogeneous):
+    """
+    Validate the pca option against feature groups.
+
+    Parameters
+    ----------
+    pca : False, int, or dict
+        PCA configuration.
+    groups : dict
+        Feature groups from _group_bands_by_features.
+    is_heterogeneous : bool
+        Whether feature types are heterogeneous.
+
+    Returns
+    -------
+    pca_per_group : dict or None
+        Maps group keys to int (n_components), or None if no PCA.
+    """
+    if pca is False or pca is None:
+        return None
+
+    if isinstance(pca, int):
+        if is_heterogeneous:
+            raise ValueError(
+                "pca must be a dict (not int) when using heterogeneous feature types. "
+                "Use a dict mapping feature group keys to n_components, e.g. "
+                "{'amplitude': 10, ('real', 'imag'): 5}."
+            )
+        # Homogeneous: all groups get the same n_components
+        return {key: pca for key in groups}
+
+    if isinstance(pca, dict):
+        # Normalize pca dict keys: sort tuple keys so order doesn't matter
+        normalized_pca = {}
+        for k, v in pca.items():
+            norm_key = tuple(sorted(k)) if isinstance(k, tuple) else k
+            if not isinstance(v, int) or v < 1:
+                raise ValueError(f"pca[{k!r}] must be a positive integer, got {v!r}.")
+            normalized_pca[norm_key] = v
+
+        group_keys = set(groups.keys())
+        pca_keys = set(normalized_pca.keys())
+        missing = group_keys - pca_keys
+        extra = pca_keys - group_keys
+        if missing:
+            raise ValueError(
+                f"pca dict is missing entries for feature groups: {missing}. "
+                f"Expected keys: {group_keys}"
+            )
+        if extra:
+            raise ValueError(
+                f"pca dict has extra keys not matching any feature group: {extra}. "
+                f"Expected keys: {group_keys}"
+            )
+        return normalized_pca
+
+    raise ValueError(f"pca must be False, an int, or a dict, got {type(pca).__name__}.")
+
+
+def _apply_pca_to_group(data_band, n_components):
+    """
+    Apply standardization and CircularPCA to a complex data array.
+
+    Parameters
+    ----------
+    data_band : np.ndarray
+        Complex array of shape (n_epochs, n_channels_bands, n_times).
+    n_components : int
+        Number of PCA components to keep.
+
+    Returns
+    -------
+    np.ndarray
+        Complex array of shape (n_epochs, n_components, n_times).
+    """
+    n_epochs, n_channels_bands, n_times = data_band.shape
+    X = data_band.transpose(1, 2, 0).reshape(n_channels_bands, n_times * n_epochs)
+
+    mean = np.mean(X, axis=1, keepdims=True)
+    std = np.std(X, axis=1, keepdims=True)
+    std[std == 0] = 1.0
+    X = (X - mean) / std
+
+    if np.any(np.isnan(X)):
+        raise ValueError("Standardization produced NaN values. This may indicate constant features.")
+    if np.any(np.isinf(X)):
+        raise ValueError("Standardization produced Inf values. This may indicate numerical instability.")
+
+    cpca = CircularPCA(n_components=n_components)
+    result = cpca.fit_transform(X.T)
+    return result.scores.reshape(n_times, n_epochs, n_components).transpose(1, 2, 0)
+
+
+def _extract_features(data_band, feature_list):
+    """
+    Extract specified features from complex data.
+
+    Parameters
+    ----------
+    data_band : np.ndarray
+        Complex array of shape (n_epochs, n_channels, n_times).
+    feature_list : list of str
+        Features to extract: 'amplitude', 'phase', 'real', 'imag'.
+
+    Returns
+    -------
+    np.ndarray
+        Real array of shape (n_epochs, n_channels * len(feature_list), n_times).
+    """
+    parts = []
+    for feature in feature_list:
+        if feature == 'amplitude':
+            parts.append(np.abs(data_band))
+        elif feature == 'phase':
+            parts.append(np.angle(data_band))
+        elif feature == 'real':
+            parts.append(np.real(data_band))
+        elif feature == 'imag':
+            parts.append(np.imag(data_band))
+        else:
+            raise ValueError(f"Unknown feature: {feature}")
+    return np.concatenate(parts, axis=1)
+
+
 def _get_time_freq_features(data, time_freq_options):
     """
     Extract time-frequency features from MEG epochs data.
@@ -160,6 +392,9 @@ def _get_time_freq_features(data, time_freq_options):
     and extracting specified features (amplitude, phase, real, or imaginary parts).
     Optionally applies PCA dimensionality reduction using CircularPCA.
 
+    Supports both homogeneous features (same feature types for all bands) and
+    heterogeneous features (different feature types per band).
+
     Parameters
     ----------
     data : mne.Epochs
@@ -167,98 +402,98 @@ def _get_time_freq_features(data, time_freq_options):
     time_freq_options : dict
         Configuration dictionary with the following keys:
         - 'FREQ_BANDS' : list of tuples
-            List of (low_freq, high_freq) tuples defining frequency bands to extract
-        - 'feature_types' : list of str
-            Types of features to extract from complex signals: 'amplitude', 'phase', 'real', 'imag'
+            List of (low_freq, high_freq) tuples defining frequency bands to extract.
+        - 'feature_types' : str, list of str, or list of (str or list of str)
+            Homogeneous: a single string (e.g. 'amplitude') or list of strings
+            (e.g. ['real', 'imag']) applied to all bands.
+            Heterogeneous: a list of same length as FREQ_BANDS where each element
+            is a string or list of strings specifying features for that band, e.g.
+            [['amplitude'], ['real', 'imag'], ['real', 'imag']].
         - 'time_window' : tuple or None, optional
-            (start_time, end_time) tuple to restrict analysis to specific time window
-        - 'pca' : int or False, optional
-            Number of PCA components to keep. If False, no PCA is applied.
+            (start_time, end_time) tuple to restrict analysis to specific time window.
+        - 'pca' : int, dict, or False, optional
+            Number of PCA components to keep.
+            - False: no PCA.
+            - int: same PCA for all bands (only valid with homogeneous features).
+            - dict: per-feature-group PCA. Keys are group identifiers matching the
+              feature type set (a string for single-feature groups, e.g. 'amplitude',
+              or a tuple for multi-feature groups, e.g. ('real', 'imag')).
+              Values are int (number of PCA components). Bands sharing the same
+              feature types are grouped and PCA'd together.
 
     Returns
     -------
     features : np.ndarray
-        Extracted features with shape (n_epochs, n_features * n_bands * n_feature_types, n_times)
-        where n_features depends on whether PCA was applied (n_pca_components vs n_channels * n_bands)
+        Extracted features with shape (n_epochs, n_total_features, n_times).
     times : np.ndarray
-        Time points corresponding to the features, shape (n_times,)
+        Time points corresponding to the features, shape (n_times,).
 
-    Notes
-    -----
-    The processing pipeline includes:
-    1. Band-pass filtering and Hilbert transform for each frequency band
-    2. Optional time window restriction
-    3. Optional PCA dimensionality reduction using CircularPCA
-    4. Feature extraction (amplitude/phase/real/imaginary parts)
-    5. Concatenation of all features along the channel axis
+    Examples
+    --------
+    Homogeneous (backward compatible)::
+
+        time_freq_options = {
+            'FREQ_BANDS': [(8, 12), (13, 30)],
+            'feature_types': ['amplitude'],
+            'pca': 10,
+        }
+
+    Heterogeneous::
+
+        time_freq_options = {
+            'FREQ_BANDS': [(8, 12), (13, 30), (30, 60)],
+            'feature_types': [['amplitude'], ['real', 'imag'], ['real', 'imag']],
+            'pca': {'amplitude': 10, ('real', 'imag'): 5},
+        }
     """
-
-    # filter per frequency band and apply Hilbert transform
     freq_bands = time_freq_options['FREQ_BANDS']
-    data_band = []
+    n_bands = len(freq_bands)
+
+    per_band_features, is_heterogeneous = _normalize_feature_types(
+        time_freq_options['feature_types'], n_bands
+    )
+    groups = _group_bands_by_features(per_band_features)
+    pca_per_group = _validate_pca_option(
+        time_freq_options.get('pca', False), groups, is_heterogeneous
+    )
+
+    # Filter per frequency band and apply Hilbert transform
+    per_band_data = []
+    times = None
+    time_mask = None
     for l_freq, h_freq in freq_bands:
-        # filter and apply Hilbert transform for this band
         _data_band = data.copy(
                 ).filter(l_freq=l_freq, h_freq=h_freq, verbose=False
                 ).apply_hilbert(verbose=False)
-        data_band_array =_data_band.get_data()
-        
-        # Get data only from a specific time window
+        data_band_array = _data_band.get_data()
+
         if time_freq_options.get('time_window', None) is not None:
             times = _data_band.times
             time_mask = (times >= time_freq_options['time_window'][0]) & (times <= time_freq_options['time_window'][1])
-            data_band_array = data_band_array[:, :, time_mask] # shape: (n_epochs, n_channels, n_times)
-            
-        data_band.append(data_band_array)
-    
-    # concatenate across bands
-    data_band = np.concatenate(data_band, axis=1) # shape: (n_epochs, n_channels * n_bands, n_times)
+            data_band_array = data_band_array[:, :, time_mask]
 
-    # do dimensionality reduction (PCA) if needed
-    if time_freq_options.get('pca', False):
-        n_epochs, n_channels_bands, n_times = data_band.shape
-        # Reshape to (n_channels_bands, n_times * n_epochs)
-        X = data_band.transpose(1, 2, 0).reshape(n_channels_bands, n_times * n_epochs)
+        per_band_data.append(data_band_array)
 
-        # standardize features (because different bands have different power)
-        mean = np.mean(X, axis=1, keepdims=True)
-        std = np.std(X, axis=1, keepdims=True)
-        
-        # Handle potential division by zero (std=0)
-        std[std == 0] = 1.0  # Set zero std to 1 to avoid division by zero
-        
-        X = (X - mean) / std
-        
-        # Check for NaN/Inf after standardization
-        if np.any(np.isnan(X)):
-            raise ValueError("Standardization produced NaN values. This may indicate constant features.")
-        if np.any(np.isinf(X)):
-            raise ValueError("Standardization produced Inf values. This may indicate numerical instability.")
+    if times is None:
+        times = _data_band.times
+        time_mask = np.ones(len(times), dtype=bool)
 
-        # compute PCA
-        cpca = CircularPCA(n_components=time_freq_options['pca'])
-        result = cpca.fit_transform(X.T)  # X.T shape: (n_times * n_epochs, n_channels_bands)
-        # result.scores shape: (n_times * n_epochs, n_pcs)
-        # Reshape back to (n_epochs, n_pcs, n_times)
-        data_band = result.scores.reshape(n_times, n_epochs, time_freq_options['pca']).transpose(1, 2, 0)
+    # Process each feature group: concatenate bands → optional PCA → extract features
+    all_features = []
+    for group_key, band_indices in groups.items():
+        # Concatenate bands in this group along channel axis
+        group_data = np.concatenate([per_band_data[i] for i in band_indices], axis=1)
 
-    # get requested features
-    band_features = []
-    for feature in time_freq_options['feature_types']:
-        if feature == 'amplitude':
-            band_features.append(np.abs(data_band))
-        elif feature == 'phase':
-            band_features.append(np.angle(data_band))
-        elif feature == 'real':
-            band_features.append(np.real(data_band))
-        elif feature == 'imag':
-            band_features.append(np.imag(data_band))
-        else:
-            raise ValueError(f"Unknown feature: {feature}")
+        # Apply PCA if requested for this group
+        if pca_per_group is not None and group_key in pca_per_group:
+            group_data = _apply_pca_to_group(group_data, pca_per_group[group_key])
 
-    # concatenate along channels axis
-    # final shape: (n_epochs, n_features * n_bands, n_times)
-    return np.concatenate(band_features, axis=1), times[time_mask]
+        # Determine feature list for this group
+        feature_list = per_band_features[band_indices[0]]
+        all_features.append(_extract_features(group_data, feature_list))
+
+    # Concatenate all groups along channel axis
+    return np.concatenate(all_features, axis=1), times[time_mask]
 
 
 def load_epochs(subject,session, DERIVATIVES_DIR):

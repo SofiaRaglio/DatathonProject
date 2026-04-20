@@ -1,0 +1,75 @@
+{
+  "timestamp": "20260420_085808",
+  "analysis_type": "time_frequency_comparison",
+  "time_frequency_config": {
+    "FREQ_BANDS": [
+      [
+        0.5,
+        2
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        4,
+        8
+      ],
+      [
+        8,
+        12
+      ],
+      [
+        12,
+        40
+      ]
+    ],
+    "feature_types": [
+      [
+        "real",
+        "imag"
+      ],
+      [
+        "real",
+        "imag"
+      ],
+      [
+        "real",
+        "imag"
+      ],
+      [
+        "amplitude"
+      ],
+      [
+        "amplitude"
+      ]
+    ],
+    "time_window": [
+      -0.5,
+      0.75
+    ],
+    "pca": {
+      "amplitude": 40,
+      "('real', 'imag')": 80
+    }
+  },
+  "decoding_jobs": [
+    [
+      "ER_diffRS_z",
+      "response"
+    ],
+    [
+      "EU_diffRS_z",
+      "response"
+    ],
+    [
+      "PE_z",
+      "feedback"
+    ]
+  ],
+  "subjects": [
+    "01",
+    "11",
+    "19"
+  ]
+}
